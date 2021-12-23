@@ -26,7 +26,6 @@
  */
 
 #include <sys/param.h>
-#include <sys/cpuset.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/mman.h>
@@ -54,7 +53,18 @@
 #include <sysexits.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/vm_inherit.h>
+#include <mach/clock_types.h>
+#else
+#include <sys/cpuset.h>
+#endif
 
+#ifdef WITH_KPC
+#include "yybench_perf.h"
+
+yy_perf *perf[2];
+#endif
 
 /*
  * L41: Labs 2 and 3 - IPC and TCP.  This benchmark pushes data through one of
@@ -204,7 +214,9 @@ static uint64_t pmc_values[COUNTERSET_MAX_EVENTS];
 
 static const char **counterset;		/* The actual counter set in use. */
 
+#ifndef __APPLE__
 int	__sys_clock_gettime(__clockid_t, struct timespec *ts);
+#endif
 
 static void
 pmc_setup_run(void)
@@ -489,8 +501,22 @@ sender(struct sender_argument *sap)
 	ssize_t len;
 	long write_sofar;
 
-	if (__sys_clock_gettime(CLOCK_REALTIME, &sap->sa_starttime) < 0)
+	if (
+#ifdef __APPLE__
+		clock_gettime(CLOCK_UPTIME_RAW,
+#else
+		__sys_clock_gettime(CLOCK_REALTIME,
+#endif
+		    &sap->sa_starttime) < 0
+		)
 		xo_err(EX_OSERR, "FAIL: __sys_clock_gettime");
+
+#ifdef WITH_KPC
+	if (!yy_perf_open(perf[0]))
+		xo_err(EX_OSERR, "FAIL: yy_perf_open");
+	yy_perf_start_counting(perf[0]);
+#endif
+
 #ifdef WITH_PMC
 	if (benchmark_pmc != BENCHMARK_PMC_NONE)
 		pmc_begin();
@@ -502,8 +528,7 @@ sender(struct sender_argument *sap)
 	write_sofar = 0;
 	while (write_sofar < totalsize) {
 		const size_t bytes_to_write = min(buffersize, totalsize - write_sofar);
-		len = write(sap->sa_writefd, sap->sa_buffer,
-		    min(buffersize, totalsize - write_sofar));
+		len = write(sap->sa_writefd, sap->sa_buffer, bytes_to_write);
 		/*printf("write(%d, %zd, %zd) = %zd\n", sap->sa_writefd, 0, bytes_to_write, len);*/
 		if (len != bytes_to_write) {
 			xo_errx(EX_IOERR, "blocking write() returned early: "
@@ -513,6 +538,10 @@ sender(struct sender_argument *sap)
 			xo_err(EX_IOERR, "FAIL: write");
 		write_sofar += len;
 	}
+
+#ifdef WITH_KPC
+	yy_perf_stop_counting(perf[0]);
+#endif
 }
 
 static struct timespec
@@ -521,6 +550,12 @@ receiver(int readfd, void *buf)
 	struct timespec finishtime;
 	ssize_t len;
 	long read_sofar;
+
+#ifdef WITH_KPC
+	if (!yy_perf_open(perf[1]))
+		xo_err(EX_OSERR, "FAIL: yy_perf_open");
+	yy_perf_start_counting(perf[1]);
+#endif
 
 	read_sofar = 0;
 	/** read() always returns as soon as there is something to read,
@@ -541,11 +576,22 @@ receiver(int readfd, void *buf)
 	/*
 	 * HERE ENDS THE BENCHMARK (2-thread/2-proc).
 	 */
+
+#ifdef WITH_KPC
+	yy_perf_stop_counting(perf[1]);
+#endif
+
 #ifdef WITH_PMC
 	if (benchmark_pmc != BENCHMARK_PMC_NONE)
 		pmc_end();
 #endif
-	if (__sys_clock_gettime(CLOCK_REALTIME, &finishtime) < 0)
+	if (
+#ifdef __APPLE__
+		clock_gettime(CLOCK_UPTIME_RAW,
+#else
+		__sys_clock_gettime(CLOCK_REALTIME,
+#endif
+		    &finishtime) < 0)
 		xo_err(EX_OSERR, "FAIL: __sys_clock_gettime");
 	return (finishtime);
 }
@@ -586,7 +632,11 @@ do_2thread(int readfd, int writefd, long msgcount, void *readbuf,
 	finishtime = receiver(readfd, readbuf);
 	if (pthread_join(thread, NULL) < 0)
 		xo_err(EX_OSERR, "FAIL: pthread_join");
+#ifdef __APPLE__
+	SUB_MACH_TIMESPEC(&finishtime, &sa.sa_starttime);
+#else
 	timespecsub(&finishtime, &sa.sa_starttime, &finishtime);
+#endif
 	return (finishtime);
 }
 
@@ -603,10 +653,17 @@ do_2proc(int readfd, int writefd, long msgcount, void *readbuf,
 	 * passing arguments, but also getting back the starting timestamp
  	 * that may be somewhat after the time of fork() in this process.
 	 */
-	if ((sap = mmap(NULL, getpagesize(), PROT_READ | PROT_WRITE, MAP_ANON,
+	if ((sap = mmap(NULL, getpagesize(), PROT_READ | PROT_WRITE,
+	    MAP_ANON | MAP_SHARED,
 	    -1, 0)) == MAP_FAILED)
 		xo_err(EX_OSERR, "mmap");
-	if (minherit(sap, getpagesize(), INHERIT_SHARE) < 0)
+	if (minherit(sap, getpagesize(),
+#ifdef __APPLE__
+		    VM_INHERIT_SHARE
+#else
+		    INHERIT_SHARE
+#endif
+		    ) < 0)
 		xo_err(EX_OSERR, "minherit");
 	sap->sa_writefd = writefd;
 	sap->sa_msgcount = msgcount;
@@ -623,9 +680,13 @@ do_2proc(int readfd, int writefd, long msgcount, void *readbuf,
 	finishtime = receiver(readfd, readbuf);
 	if ((pid2 = waitpid(pid, NULL, 0)) < 0)
 		xo_err(EX_OSERR, "FAIL: waitpid");
+#ifdef __APPLE__
+	SUB_MACH_TIMESPEC(&finishtime, &sap->sa_starttime);
+#else
+	timespecsub(&finishtime, &sap->sa_starttime, &finishtime);
+#endif
 	if (pid2 != pid)
 		xo_err(EX_OSERR, "FAIL: waitpid PID mismatch");
-	timespecsub(&finishtime, &sap->sa_starttime, &finishtime);
 	return (finishtime);
 }
 
@@ -668,8 +729,21 @@ do_1thread(int readfd, int writefd, long msgcount, void *readbuf,
 	FD_ZERO(&fdset_write);
 	FD_SET(writefd, &fdset_write);
 
-	if (__sys_clock_gettime(CLOCK_REALTIME, &starttime) < 0)
+	if (
+#ifdef __APPLE__
+		clock_gettime(CLOCK_UPTIME_RAW,
+#else
+		__sys_clock_gettime(CLOCK_REALTIME,
+#endif
+		    &starttime) < 0)
 		xo_err(EX_OSERR, "FAIL: __sys_clock_gettime");
+
+#ifdef WITH_KPC
+	if (!yy_perf_open(perf[0]))
+		xo_err(EX_OSERR, "FAIL: yy_perf_open");
+	yy_perf_start_counting(perf[0]);
+#endif
+
 #ifdef WITH_PMC
 	if (benchmark_pmc != BENCHMARK_PMC_NONE)
 		pmc_begin();
@@ -722,13 +796,27 @@ do_1thread(int readfd, int writefd, long msgcount, void *readbuf,
 	/*
 	 * HERE ENDS THE BENCHMARK (1-thread).
 	 */
+#ifdef WITH_KPC
+	yy_perf_stop_counting(perf[0]);
+#endif
+
 #ifdef WITH_PMC
 	if (benchmark_pmc != BENCHMARK_PMC_NONE)
 		pmc_end();
 #endif
-	if (__sys_clock_gettime(CLOCK_REALTIME, &finishtime) < 0)
+	if (
+#ifdef __APPLE__
+		clock_gettime(CLOCK_UPTIME_RAW,
+#else
+		__sys_clock_gettime(CLOCK_REALTIME,
+#endif
+		    &finishtime) < 0)
 		xo_err(EX_OSERR, "FAIL: __sys_clock_gettime");
+#ifdef __APPLE__
+	SUB_MACH_TIMESPEC(&finishtime, &starttime);
+#else
 	timespecsub(&finishtime, &starttime, &finishtime);
+#endif
 	return (finishtime);
 }
 
@@ -909,9 +997,10 @@ print_configuration(void)
 	char buffer[80];
 	int integer;
 	unsigned long unsignedlong;
+#ifndef __APPLE__
 	unsigned long pagesizes[MAXPAGESIZES];
+#endif
 	size_t len;
-	int i;
 
 	xo_open_container("host_configuration");
 	xo_emit("Host configuration:\n");
@@ -942,6 +1031,7 @@ print_configuration(void)
 		xo_err(EX_OSERR, "sysctlbyname: hw.physmem");
 	xo_emit("  hw.physmem: {:hw.physmem/%lu}\n", unsignedlong);
 
+#ifndef __APPLE__
 	/* hw.pagesizes */
 	len = sizeof(pagesizes);
 	if (sysctlbyname("hw.pagesizes", &pagesizes, &len, NULL, 0) < 0)
@@ -961,6 +1051,7 @@ print_configuration(void)
 		xo_err(EX_OSERR, "sysctlbyname: hw.cpufreq.arm_freq");
 	xo_emit("  hw.cpufreq.arm_freq: {:hw.cpufreq.arm_freq/%lu}\n",
 	    integer);
+#endif
 
 	/* kern.ostype */
 	len = sizeof(buffer);
@@ -1049,8 +1140,10 @@ print_configuration(void)
 	    benchmark_mode_to_string(benchmark_mode));
 	xo_emit("  ipctype: {:ipctype/%s}\n",
 	    ipc_type_to_string(ipc_type));
+#ifdef WITH_PMC
 	xo_emit("  pmctype: {:pmctype/%s}\n",
 	    benchmark_pmc_to_string(benchmark_pmc));
+#endif
 	xo_emit("  iterations: {:iterations/%ld}\n", iterations);
 	xo_close_container("benchmark_configuration");
 
@@ -1065,9 +1158,11 @@ ipc(void)
 	struct timeval tv_self, tv_children, tv_total;
 	struct timespec ts;
 	void *readbuf, *writebuf;
-	int i, iteration, readfd, writefd;
+	int iteration, readfd, writefd;
 	double secs, rate;
+#ifndef __APPLE__
 	cpuset_t cpuset_mask;
+#endif
 #ifdef WITH_PMC
 	float f;
 #endif
@@ -1079,6 +1174,7 @@ ipc(void)
 	if (msgcount < 0)
 		xo_errx(EX_USAGE, "FAIL: negative block count");
 
+#ifndef __APPLE__
 	/*
 	 * For the purposes of lab simplicity, pin the benchmark (this process
 	 * and all its children processes) to CPU 0.
@@ -1088,6 +1184,21 @@ ipc(void)
 	if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1,
 	    sizeof(cpuset_mask), &cpuset_mask) < 0)
 		xo_err(EX_OSERR, "FAIL: cpuset_setaffinity");
+#endif
+
+#ifdef WITH_KPC
+	if (!yy_perf_load(true))
+		xo_err(EX_OSERR, "FAIL: yy_perf_load");
+	for (int i = 0; i < 2; ++i) {
+		perf[i] = yy_perf_new();
+		if (!perf[i])
+			xo_err(EX_OSERR, "FAIL: yy_perf_new");
+		yy_perf_add_event(perf[i], YY_PERF_EVENT_LOADS);
+		yy_perf_add_event(perf[i], YY_PERF_EVENT_STORES);
+		yy_perf_add_event(perf[i], YY_PERF_EVENT_STLB_MISS_LOADS);
+		yy_perf_add_event(perf[i], YY_PERF_EVENT_STLB_MISS_STORES);
+	}
+#endif
 
 #ifdef WITH_PMC
 	/*
@@ -1103,13 +1214,13 @@ ipc(void)
 	 * loop itself.
 	 */
 	readbuf = mmap(NULL, buffersize, PROT_READ | PROT_WRITE,
-	    MAP_ANON, -1, 0);
-	if (readbuf == NULL)
+	    MAP_ANON | MAP_SHARED, -1, 0);
+	if (readbuf == MAP_FAILED)
 		xo_err(EX_OSERR, "FAIL: mmap");
 	memset(readbuf, 0, buffersize);
 	writebuf = mmap(NULL, buffersize, PROT_READ | PROT_WRITE,
-	    MAP_ANON, -1, 0);
-	if (writebuf == NULL)
+	    MAP_ANON | MAP_SHARED, -1, 0);
+	if (writebuf == MAP_FAILED)
 		xo_err(EX_OSERR, "FAIL: mmap");
 	memset(writebuf, 0, buffersize);
 
@@ -1230,6 +1341,19 @@ ipc(void)
 			xo_emit("  time: {:time/%jd.%09jd} seconds\n",
 			    (intmax_t)ts.tv_sec, (intmax_t)ts.tv_nsec);
 		}
+
+#ifdef WITH_KPC
+		u64 total = 0, misses = 0;
+		for (int i = 0; i < 2; ++i) {
+			u64 *vals = yy_perf_get_counters(perf[i]);
+			total += vals[0] + vals[1];
+			misses += vals[2] + vals[3];
+		}
+		xo_emit("  mem-access: {:mem-access/%lld}\n", total);
+		xo_emit("  mem-access-miss: {:mem-access-miss/%lld}\n", misses);
+		xo_emit("  tlb-miss-rate: {:tlb-miss-rate/%lf}\n", (double)misses / total);
+#endif
+
 #ifdef WITH_PMC
 		/* Print baseline measured counters. */
 		if (!qflag && (benchmark_pmc != BENCHMARK_PMC_NONE)) {
@@ -1326,6 +1450,7 @@ ipc(void)
 			    (rusage_children_after.ru_msgrcv -
 			    rusage_children_before.ru_msgrcv));
 		}
+
 		if (!qflag) {
 			xo_close_instance("datum");
 			xo_flush();
@@ -1341,6 +1466,12 @@ ipc(void)
 		close(readfd);
 		close(writefd);
 	}
+
+#ifdef WITH_KPC
+	for (int i = 0; i < 2; ++i)
+		yy_perf_free(perf[i]);
+#endif
+
 	if (!qflag) {
 		xo_close_list("benchmark_samples");
 		xo_finish();
